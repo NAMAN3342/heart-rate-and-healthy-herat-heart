@@ -25,15 +25,14 @@ export default function App() {
   const canvasRef = useRef(null);
   const [port, setPort] = useState(null);
   const [bpm, setBpm] = useState(null);
+  const [lastSerialLine, setLastSerialLine] = useState('');
+  const [lastParsedBpm, setLastParsedBpm] = useState(null);
+  const [lastParsedIrr, setLastParsedIrr] = useState(null);
   const [healthCategory, setHealthCategory] = useState({level:'--',score:0,desc:''});
   const [showHealthInfo, setShowHealthInfo] = useState(false);
   const [breakdown, setBreakdown] = useState({brady:0,tachy:0,irregularity:0});
-  const [demoMode, setDemoMode] = useState(false);
   const [calibrating, setCalibrating] = useState(false);
-  const [signalQuality, setSignalQuality] = useState('unknown');
-  const [checkingSignal, setCheckingSignal] = useState(false);
-  const [signalCheckProgress, setSignalCheckProgress] = useState(0);
-  const [monitoringActive, setMonitoringActive] = useState(false); // 'good', 'poor', 'disconnected', 'unknown'
+  const [monitoringActive, setMonitoringActive] = useState(false);
   const samplesRef = useRef([]); // Lead II (A1) samples - circular buffer
   const samples2Ref = useRef([]); // Lead I (A0) samples - circular buffer
   const beatsRef = useRef([]); // timestamps (ms) of heart beats (from bpm messages)
@@ -52,67 +51,36 @@ export default function App() {
     return () => { anim = false };
   }, []);
 
-  // Demo mode effect - generate fake ECG data
   useEffect(() => {
-    if (!demoMode) return;
-    
-    let t = 0;
-    const interval = setInterval(() => {
-      // Generate synthetic ECG-like waveform
-      const val = 0.6 * Math.sin(2*Math.PI*1.2*t) + 0.2*Math.sin(2*Math.PI*20*t) + (Math.sin(2*Math.PI*0.25*t)*0.3);
-      // Add R-peak spikes
-      const spike = (Math.sin(2*Math.PI*1.2*t) > 0.95) ? 1.2 : 0;
-      const sample = val + spike;
-      
-      samplesRef.current.push(sample);
-      samples2Ref.current.push(sample * 0.8); // slightly different for Lead I
-      if (samplesRef.current.length > MAX_SAMPLES) {
-        samplesRef.current.splice(0, samplesRef.current.length - MAX_SAMPLES);
-        samples2Ref.current.splice(0, samples2Ref.current.length - MAX_SAMPLES);
-      }
-      
-      // Detect R-peaks and compute BPM
-      if (spike > 0.5) {
-        const now = Date.now();
-        if (now - lastBeatTime.current > 300) { // refractory period
-          beatsRef.current.push(now);
-          if (beatsRef.current.length > 50) {
-            beatsRef.current.splice(0, beatsRef.current.length - 50);
-          }
-          if (beatsRef.current.length >= 2) {
-            const ibi = now - beatsRef.current[beatsRef.current.length - 2];
-            const demoBpm = Math.round(60000 / ibi);
-            setBpm(demoBpm);
-          }
-          lastBeatTime.current = now;
-        }
-      }
-      
-      t += 0.008; // 125 Hz
-    }, 8);
-    
-    return () => clearInterval(interval);
-  }, [demoMode]);
-
-  useEffect(() => {
-    // whenever beatsRef updates (we push in serial loop), recompute rhythm metrics
+    // whenever beatsRef updates or bpm changes, recompute rhythm metrics
     const compute = () => {
       const beats = beatsRef.current;
-      if (beats.length < 3) return setHealthCategory({level:'Insufficient data', score:0, desc:'Need at least 3 beats to assess rhythm.'});
+      const hasArduinoIrr = window.arduinoIrregularity && window.arduinoIrregularity.length > 0;
+      // If we don't have Arduino irregularity, require at least 3 beat timestamps to compute rhythm.
+      if (!hasArduinoIrr && beats.length < 3) {
+        setHealthCategory({level:'Insufficient data', score:0, desc:'Need at least 3 beats to assess rhythm.'});
+        return;
+      }
 
-      // compute inter-beat intervals (ms)
-      const ibis = [];
-      for (let i=1;i<beats.length;i++) ibis.push(beats[i] - beats[i-1]);
-      // use last 8 IBIs
-      const last = ibis.slice(-8);
-      const {mean, sd} = computeStats(last);
-      const cv = mean > 0 ? sd / mean : 0; // coefficient of variation
-
-      // derive a simple irregularity metric (0..1)
-      const irregularity = Math.min(1, cv * 3.0); // scale factor
+      // Get irregularity from Arduino if available
+      let irregularity = 0;
+      if (hasArduinoIrr) {
+        // Use latest irregularity from Arduino (coefficient of variation)
+        const recent = window.arduinoIrregularity.slice(-5);
+        irregularity = recent.reduce((a,b) => a+b, 0) / recent.length;
+      } else {
+        // Fallback: compute inter-beat intervals (ms) from web-based detection
+        const ibis = [];
+        for (let i=1;i<beats.length;i++) ibis.push(beats[i] - beats[i-1]);
+        // use last 8 IBIs
+        const last = ibis.slice(-8);
+        const {mean, sd} = computeStats(last);
+        const cv = mean > 0 ? sd / mean : 0; // coefficient of variation
+        irregularity = Math.min(1, cv * 3.0); // scale factor
+      }
 
       // heart rate rules
-      const hr = bpm || Math.round(60000 / mean);
+      const hr = bpm || 70; // Use Arduino BPM
 
       // Health index scoring (higher is worse)
       let bradyScore = 0;
@@ -143,55 +111,7 @@ export default function App() {
     return () => clearInterval(id);
   }, [bpm]);
 
-  // Signal quality monitor
-  useEffect(() => {
-    if (!port && !demoMode) {
-      setSignalQuality('unknown');
-      return;
-    }
-    
-    const checkQuality = () => {
-      const samples = samplesRef.current;
-      if (samples.length < 50) {
-        setSignalQuality('unknown');
-        return;
-      }
-      
-      // Check last 100 samples
-      const recent = samples.slice(-100);
-      const avg = recent.reduce((a,b) => a+b, 0) / recent.length;
-      const variance = recent.reduce((a,b) => a + Math.pow(b - avg, 2), 0) / recent.length;
-      const stdDev = Math.sqrt(variance);
-      
-      // More lenient checks
-      // Check if signal is too flat (disconnected leads)
-      if (stdDev < 0.01) {
-        setSignalQuality('disconnected');
-        setBpm(null);
-        return;
-      }
-      
-      // Check if signal is extremely noisy (poor connection)
-      if (stdDev > 3.5) {
-        setSignalQuality('poor');
-        return;
-      }
-      
-      // Check for saturation (all values near min/max)
-      const nearMax = recent.filter(v => Math.abs(v) > 2.5).length;
-      if (nearMax > recent.length * 0.9) {
-        setSignalQuality('disconnected');
-        setBpm(null);
-        return;
-      }
-      
-      // Default to good if we have data coming in
-      setSignalQuality('good');
-    };
-    
-    const id = setInterval(checkQuality, 1000);
-    return () => clearInterval(id);
-  }, [port, demoMode]);
+  // Signal quality monitor - REMOVED (no auto signal quality check)
 
   function drawCanvas() {
     const canvas = canvasRef.current;
@@ -304,31 +224,6 @@ export default function App() {
             <div style={{fontSize:13,color:'#888',letterSpacing:'2px',marginTop:-4}}>BPM</div>
           </div>
         </div>
-
-        {/* Debug panel */}
-        <div style={{
-          position: 'absolute',
-          bottom: '20px',
-          right: '20px',
-          padding: '10px 15px',
-          background: 'rgba(0,0,0,0.6)',
-          borderRadius: '8px',
-          fontSize: '14px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '5px'
-        }}>
-          <div>Signal: <span style={{color: signalQuality === 'good' ? '#0f0' : signalQuality === 'poor' ? '#ff0' : '#f00'}}>{signalQuality}</span></div>
-          <div>Samples: {samplesRef.current.length}</div>
-          <div>StdDev: {(() => {
-            const samples = samplesRef.current;
-            if (samples.length < 50) return 'N/A';
-            const recent = samples.slice(-100);
-            const avg = recent.reduce((a,b) => a+b, 0) / recent.length;
-            const variance = recent.reduce((a,b) => a + Math.pow(b - avg, 2), 0) / recent.length;
-            return Math.sqrt(variance).toFixed(3);
-          })()}</div>
-        </div>
       </div>
     );
   }
@@ -383,11 +278,11 @@ export default function App() {
       setCalibrating(true);
       setMonitoringActive(false); // Monitoring disabled initially
 
-      // Auto start signal check after connection
+      // After 4 seconds, stop calibrating and start monitoring automatically
       setTimeout(() => {
         setCalibrating(false);
-        startSignalCheck();
-      }, 1000);
+        setMonitoringActive(true);
+      }, 4000);
 
       // setup text stream
       const textDecoder = new TextDecoderStream();
@@ -403,6 +298,7 @@ export default function App() {
         if (!value) continue;
         
         const line = value.trim();
+        setLastSerialLine(line);
         
         // Detect calibration messages
         if (line.includes('Calibration') || line.includes('Starting') || line.includes('Baseline') || line.includes('Gain')) {
@@ -413,11 +309,13 @@ export default function App() {
           continue;
         }
         
-        // Parse comma-separated values: value1,value2
+        // Parse comma-separated values: value1,value2,bpm,irregularity
         const parts = line.split(',');
         if (parts.length >= 2) {
           const val1 = parseFloat(parts[0]); // Lead I (A0)
           const val2 = parseFloat(parts[1]); // Lead II (A1)
+          const arduinoBPM = parts.length >= 3 ? parseInt(parts[2]) : null; // BPM from Arduino
+          const arduinoIrregularity = parts.length >= 4 ? parseFloat(parts[3]) : null; // Irregularity from Arduino
           
           if (!isNaN(val1) && !isNaN(val2)) {
             // Store Lead II (A1) as primary
@@ -429,40 +327,31 @@ export default function App() {
               samples2Ref.current.splice(0, samples2Ref.current.length - MAX_SAMPLES);
             }
             
-            // Simple R-peak detection on Lead II
-            if (!calibrating && samplesRef.current.length > 10 && monitoringActive) {
-              const recent = samplesRef.current.slice(-10);
-              const avg = recent.reduce((a,b)=>a+b,0) / recent.length;
-              const stdDev = Math.sqrt(recent.reduce((a,b)=>a+Math.pow(b-avg,2),0)/recent.length);
-              
-              // Only detect peaks if signal quality is reasonable
-              if (stdDev > 0.05 && stdDev < 2.0) {
-                const current = val2;
-                
-                // Detect peak crossing threshold
-                if (current > peakThreshold.current && current > avg * 1.5) {
-                  const now = Date.now();
-                  if (now - lastBeatTime.current > 300) { // 300ms refractory
-                    beatsRef.current.push(now);
-                    if (beatsRef.current.length > 50) {
-                      beatsRef.current.splice(0, beatsRef.current.length - 50);
-                    }
-                    
-                    // Calculate BPM from last 2 beats
-                    if (beatsRef.current.length >= 2) {
-                      const ibi = now - beatsRef.current[beatsRef.current.length - 2];
-                      const newBpm = Math.round(60000 / ibi);
-                      if (newBpm >= 40 && newBpm <= 200) {
-                        setBpm(newBpm);
-                      }
-                    }
-                    lastBeatTime.current = now;
-                    
-                    // Adapt threshold
-                    peakThreshold.current = current * 0.6;
-                  }
-                }
+            // Use BPM from Arduino if available — always update BPM so UI shows immediately
+            if (arduinoBPM && arduinoBPM > 0) {
+              console.log('Arduino BPM:', arduinoBPM, 'Monitoring:', monitoringActive);
+              // update displayed BPM
+              setBpm(arduinoBPM);
+              setLastParsedBpm(arduinoBPM);
+
+              // store a timestamp for each beat (helps web-side rhythm fallback)
+              const now = Date.now();
+              beatsRef.current.push(now);
+              if (beatsRef.current.length > 50) {
+                beatsRef.current.splice(0, beatsRef.current.length - 50);
               }
+
+              // Store irregularity value directly for use in rhythm calculation (if Arduino provides)
+              if (arduinoIrregularity !== null && arduinoIrregularity >= 0) {
+                if (!window.arduinoIrregularity) window.arduinoIrregularity = [];
+                window.arduinoIrregularity.push(arduinoIrregularity);
+                if (window.arduinoIrregularity.length > 10) {
+                  window.arduinoIrregularity.shift();
+                }
+                setLastParsedIrr(arduinoIrregularity);
+              }
+              // If BPM arrived before UI monitoring enabled, enable it automatically
+              if (!monitoringActive) setMonitoringActive(true);
             }
           }
         }
@@ -480,83 +369,17 @@ export default function App() {
     } catch(e){}
     setPort(null);
     setCalibrating(false);
-    setCheckingSignal(false);
-    setSignalCheckProgress(0);
     setMonitoringActive(false);
     setBpm(null);
+    // Clear all samples
+    samplesRef.current = [];
+    samples2Ref.current = [];
+    beatsRef.current = [];
+    if (window.arduinoIrregularity) window.arduinoIrregularity = [];
   }
 
-  async function startSignalCheck() {
-    setCheckingSignal(true);
-    setSignalCheckProgress(0);
-    
-    // Check signal for 7 seconds
-    const checkDuration = 7000;
-    const checkInterval = 100;
-    const steps = checkDuration / checkInterval;
-    
-    for (let i = 0; i <= steps; i++) {
-      setSignalCheckProgress((i / steps) * 100);
-      await new Promise(resolve => setTimeout(resolve, checkInterval));
-    }
-    
-    // After 7 seconds, check if signal is good
-    const samples = samplesRef.current;
-    if (samples.length < 50) {
-      alert('⚠️ Not enough data received. Please check connection and try reconnecting.');
-      setCheckingSignal(false);
-      setMonitoringActive(false);
-      return;
-    }
-    
-    const recent = samples.slice(-100);
-    const avg = recent.reduce((a,b) => a+b, 0) / recent.length;
-    const variance = recent.reduce((a,b) => a + Math.pow(b - avg, 2), 0) / recent.length;
-    const stdDev = Math.sqrt(variance);
-    
-    if (stdDev < 0.01) {
-      alert('❌ Signal too weak - leads may be disconnected. Please check electrode connections.');
-      setCheckingSignal(false);
-      setMonitoringActive(false);
-      return;
-    }
-    
-    if (stdDev > 3.5) {
-      alert('⚡ Signal too noisy - check electrode connections and reduce movement.');
-      setCheckingSignal(false);
-      setMonitoringActive(false);
-      return;
-    }
-    
-    // Signal is good - start monitoring
-    alert('✅ Signal Quality Good! Starting heart rate monitoring...');
-    setCheckingSignal(false);
-    setSignalCheckProgress(0);
-    setMonitoringActive(true); // Enable BPM and Health Index calculations
-  }
-
-  async function checkSignalQuality() {
-    startSignalCheck();
-  }
-
-  function toggleDemo() {
-    if (demoMode) {
-      // stop demo
-      setDemoMode(false);
-      samplesRef.current = [];
-      samples2Ref.current = [];
-      beatsRef.current = [];
-      setBpm(null);
-      setMonitoringActive(false);
-    } else {
-      // start demo
-      if (port) {
-        alert('Please disconnect from device first');
-        return;
-      }
-      setDemoMode(true);
-      setMonitoringActive(true); // Enable monitoring in demo mode
-    }
+  async function startMonitoring() {
+    setMonitoringActive(true);
   }
 
   function Heart3D({bpm}) {
@@ -643,46 +466,30 @@ export default function App() {
         {port ? (
           <>
             <button onClick={disconnectSerial}>🔌 Disconnect</button>
-            {checkingSignal && (
-              <div style={{display:'flex',alignItems:'center',gap:10,padding:'8px 16px',background:'rgba(96, 165, 250, 0.1)',borderRadius:8,border:'1px solid rgba(96, 165, 250, 0.3)'}}>
-                <div style={{fontSize:14,color:'#60a5fa'}}>Checking signal quality...</div>
-                <div style={{width:120,height:8,background:'rgba(0,0,0,0.3)',borderRadius:4,overflow:'hidden'}}>
-                  <div style={{width:`${signalCheckProgress}%`,height:'100%',background:'linear-gradient(90deg, #60a5fa, #a78bfa)',transition:'width 0.1s linear'}} />
-                </div>
-                <div style={{fontSize:12,color:'#888'}}>{Math.round(signalCheckProgress)}%</div>
+            {!monitoringActive && !calibrating && (
+              <button onClick={startMonitoring} style={{background:'linear-gradient(135deg, #4ade80, #22c55e)',color:'#000',fontWeight:700}}>
+                ▶️ Start Monitoring
+              </button>
+            )}
+            {calibrating && (
+              <div style={{display:'flex',alignItems:'center',gap:10,padding:'8px 16px',background:'rgba(251, 191, 36, 0.1)',borderRadius:8,border:'1px solid rgba(251, 191, 36, 0.3)'}}>
+                <div style={{fontSize:14,color:'#fbbf24'}}>⏳ Waiting 4 seconds after connection...</div>
+              </div>
+            )}
+            {monitoringActive && (
+              <div style={{display:'flex',alignItems:'center',gap:10,padding:'8px 16px',background:'rgba(74, 222, 128, 0.1)',borderRadius:8,border:'1px solid rgba(74, 222, 128, 0.3)'}}>
+                <div style={{fontSize:14,color:'#4ade80'}}>✅ Monitoring Active</div>
               </div>
             )}
           </>
         ) : (
-          <button onClick={connectSerial} disabled={demoMode}>🔌 Connect Device</button>
+          <button onClick={connectSerial}>🔌 Connect Device</button>
         )}
-        <button onClick={toggleDemo} style={{background: demoMode ? 'rgba(126, 247, 126, 0.15)' : ''}}>
-          {demoMode ? '⏹ Stop Demo' : '▶ Demo Mode'}
-        </button>
       </div>
 
       <div style={{display:'flex',gap:20,marginTop:20,alignItems:'flex-start'}}>
         <div style={{flex:1}}>
-          {/* Signal Quality Warning */}
-          {signalQuality === 'disconnected' && (
-            <div style={{background:'linear-gradient(135deg,#ff6b6b,#ee5a6f)',padding:12,borderRadius:6,marginBottom:12,display:'flex',alignItems:'center',gap:10}}>
-              <span style={{fontSize:24}}>⚠️</span>
-              <div>
-                <div style={{fontWeight:700,fontSize:14}}>Leads Disconnected!</div>
-                <div style={{fontSize:12,opacity:0.9}}>Please check electrode connections</div>
-              </div>
-            </div>
-          )}
-          {signalQuality === 'poor' && (
-            <div style={{background:'linear-gradient(135deg,#ffb020,#ff9500)',padding:12,borderRadius:6,marginBottom:12,display:'flex',alignItems:'center',gap:10}}>
-              <span style={{fontSize:24}}>⚡</span>
-              <div>
-                <div style={{fontWeight:700,fontSize:14}}>Poor Signal Quality</div>
-                <div style={{fontSize:12,opacity:0.9}}>Check connections or reduce movement</div>
-              </div>
-            </div>
-          )}
-          
+          {/* ECG Waveform Canvas */}
           <div style={{display:'flex',gap:12,alignItems:'stretch'}}>
             <div style={{flex:1}}>
               <canvas ref={canvasRef} style={{width:'100%',minHeight:'320px',border:'1px solid #2a3540',background:'#0d1218',borderRadius:6,boxShadow:'0 6px 18px rgba(0,0,0,0.5)'}} />
@@ -690,15 +497,13 @@ export default function App() {
             <div style={{width:180,display:'flex',flexDirection:'column',gap:12}}>
               {/* Heart Rate Gauge Block */}
               <div style={{background:'linear-gradient(180deg,rgba(30,30,30,0.8),rgba(20,20,20,0.9))',padding:16,borderRadius:8,border:'1px solid #2a3540',display:'flex',flexDirection:'column',alignItems:'center',gap:8}}>
-                <Gauge value={monitoringActive ? bpm : null} />
+                <Gauge value={(monitoringActive && port) ? bpm : null} />
                 <div style={{textAlign:'center',marginTop:8}}>
                   <div style={{fontSize:14,color:'#aaa',marginBottom:4}}>Current Heart Rate</div>
-                  {checkingSignal && <span style={{color:'#60a5fa',fontSize:11}}>🔍 Checking Signal...</span>}
-                  {calibrating && <span style={{color:'#ffb020',fontSize:11}}>🔄 Calibrating...</span>}
-                  {demoMode && !calibrating && <span style={{color:'#7ef77e',fontSize:11}}>● Demo Mode</span>}
-                  {port && !demoMode && !calibrating && !checkingSignal && monitoringActive && <span style={{color:'#7ef77e',fontSize:11}}>● Monitoring Active</span>}
-                  {port && !demoMode && !calibrating && !checkingSignal && !monitoringActive && <span style={{color:'#888',fontSize:11}}>⏸ Waiting for Signal Check</span>}
-                  {!port && !demoMode && <span style={{color:'#888',fontSize:11}}>○ Not connected</span>}
+                  {calibrating && <span style={{color:'#ffb020',fontSize:11}}>⏳ Waiting 4 seconds...</span>}
+                  {port && !calibrating && monitoringActive && <span style={{color:'#7ef77e',fontSize:11}}>● Monitoring Active</span>}
+                  {port && !calibrating && !monitoringActive && <span style={{color:'#fbbf24',fontSize:11}}>⏸ Click "Start Monitoring"</span>}
+                  {!port && <span style={{color:'#888',fontSize:11}}>○ Not connected</span>}
                 </div>
               </div>
 
@@ -706,9 +511,7 @@ export default function App() {
               <div style={{background:'linear-gradient(180deg,rgba(30,30,30,0.8),rgba(20,20,20,0.9))',padding:12,borderRadius:8,border:'1px solid #2a3540',textAlign:'center'}}>
                 <div style={{fontSize:11,color:'#888',marginBottom:4}}>DATA SAMPLES</div>
                 <div style={{fontSize:24,fontWeight:700,color:'#ff4444'}}>{samplesRef.current.length}</div>
-                {signalQuality === 'good' && <div style={{fontSize:10,color:'#7ef77e',marginTop:4}}>✓ Good Signal</div>}
-                {signalQuality === 'poor' && <div style={{fontSize:10,color:'#ffb020',marginTop:4}}>⚡ Noisy</div>}
-                {signalQuality === 'disconnected' && <div style={{fontSize:10,color:'#ff6b6b',marginTop:4}}>⚠ No Leads</div>}
+                <div style={{fontSize:10,color:'#888',marginTop:4}}>Lead II (A1)</div>
               </div>
 
               {/* 3D Heart Block */}
@@ -716,12 +519,21 @@ export default function App() {
                 <Heart3D bpm={bpm} />
                 <div style={{fontSize:11,color:'#888'}}>Live Pulse</div>
               </div>
+
+              {/* Debug info (serial + parsed) */}
+              <div style={{marginTop:8,padding:10,background:'rgba(255,255,255,0.02)',borderRadius:8,border:'1px solid rgba(255,255,255,0.03)',fontSize:12,color:'#ccc'}}>
+                <div style={{fontWeight:700,color:'#fff',marginBottom:6}}>Debug</div>
+                <div><strong>Last line:</strong> <span style={{color:'#9ad0ff'}}>{lastSerialLine || '—'}</span></div>
+                <div><strong>Parsed BPM:</strong> <span style={{color:'#9ef78a'}}>{lastParsedBpm ?? '--'}</span></div>
+                <div><strong>Parsed Irr:</strong> <span style={{color:'#ffd280'}}>{lastParsedIrr ?? '--'}</span></div>
+                <div style={{marginTop:6}}><strong>Monitoring:</strong> {monitoringActive ? 'yes' : 'no'} &middot; <strong>Port:</strong> {port ? 'connected' : 'disconnected'}</div>
+              </div>
             </div>
           </div>
         </div>
 
-        {/* Heart Health Index - only show if monitoring is active and signal is good */}
-        {monitoringActive && signalQuality === 'good' && (
+        {/* Heart Health Index - only show if monitoring is active */}
+        {monitoringActive && (
           <div style={{width:360,background:'linear-gradient(180deg,#1a2332,#151e2b)',padding:16,borderRadius:8,border:'1px solid #2a3540',color:'#eee',boxShadow:'0 8px 20px rgba(0,0,0,0.4)'}}>
             <h3 style={{marginTop:0,color:'#fff'}}>Heart Health Index</h3>
             
