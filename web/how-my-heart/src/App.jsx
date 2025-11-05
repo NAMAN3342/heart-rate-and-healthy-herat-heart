@@ -37,6 +37,8 @@ export default function App() {
   const samples2Ref = useRef([]); // Lead I (A0) samples - circular buffer
   const beatsRef = useRef([]); // timestamps (ms) of heart beats (from bpm messages)
   const MAX_SAMPLES = 1500; // ~12 seconds at 125 Hz
+  const ARDUINO_SAMPLE_RATE = 125; // Hz - incoming sample rate from Arduino
+  const SAMPLE_PERIOD_MS = 1000 / ARDUINO_SAMPLE_RATE;
   const lastBeatTime = useRef(0);
   const peakThreshold = useRef(0.3); // Dynamic threshold for R-peak detection
 
@@ -57,7 +59,7 @@ export default function App() {
     let lastPeakTime = 0;
     let lastProcessedIndex = 0;
 
-    const detectionInterval = setInterval(() => {
+  const detectionInterval = setInterval(() => {
       const samples = samplesRef.current;
       const n = samples.length;
       if (n < 50) return;
@@ -109,7 +111,7 @@ export default function App() {
       }
 
       lastProcessedIndex = Math.max(0, n - 2);
-    }, 40); // run ~25Hz
+  }, Math.max(20, Math.round(SAMPLE_PERIOD_MS * 4))); // run every ~4 samples (32ms at 125Hz)
 
     return () => clearInterval(detectionInterval);
   }, []);
