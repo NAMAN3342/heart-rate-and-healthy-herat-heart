@@ -51,6 +51,69 @@ export default function App() {
     return () => { anim = false };
   }, []);
 
+  // Browser-side R-peak detector (runs on Lead II / samplesRef)
+  useEffect(() => {
+    const MIN_BEAT_INTERVAL = 300; // ms
+    let lastPeakTime = 0;
+    let lastProcessedIndex = 0;
+
+    const detectionInterval = setInterval(() => {
+      const samples = samplesRef.current;
+      const n = samples.length;
+      if (n < 50) return;
+
+      // compute recent stats for adaptive thresholding
+      const recent = samples.slice(Math.max(0, n - 200));
+      const mean = recent.reduce((a,b) => a + b, 0) / recent.length;
+      const variance = recent.reduce((a,b) => a + Math.pow(b - mean, 2), 0) / recent.length;
+      const sd = Math.sqrt(variance);
+      const thresh = mean + Math.max(0.25, sd * 0.8); // adaptive threshold
+
+      // scan new samples for local peaks
+      for (let i = Math.max(1, lastProcessedIndex); i < n - 1; i++) {
+        const v = samples[i];
+        if (v > samples[i-1] && v > samples[i+1] && v > thresh) {
+          const now = Date.now();
+          if (now - lastPeakTime > MIN_BEAT_INTERVAL) {
+            // Detected beat
+            lastPeakTime = now;
+            beatsRef.current.push(now);
+            if (beatsRef.current.length > 50) beatsRef.current.splice(0, beatsRef.current.length - 50);
+
+            // compute BPM from last interval
+            if (beatsRef.current.length >= 2) {
+              const ibi = now - beatsRef.current[beatsRef.current.length - 2];
+              const measuredBpm = Math.round(60000 / ibi);
+              setBpm(measuredBpm);
+            }
+
+            // compute irregularity (CV) from last intervals
+            if (beatsRef.current.length >= 3) {
+              const ibis = [];
+              for (let j = 1; j < beatsRef.current.length; j++) ibis.push(beatsRef.current[j] - beatsRef.current[j-1]);
+              const lastIbis = ibis.slice(-8);
+              const meanI = lastIbis.reduce((a,b) => a + b, 0) / lastIbis.length;
+              let varI = 0;
+              for (const x of lastIbis) varI += Math.pow(x - meanI, 2);
+              varI /= lastIbis.length;
+              const sdI = Math.sqrt(varI);
+              const cv = meanI > 0 ? sdI / meanI : 0;
+              const irrNorm = Math.min(1, cv * 3.0);
+              // expose to health calculator (same shape as Arduino irregularity)
+              if (!window.arduinoIrregularity) window.arduinoIrregularity = [];
+              window.arduinoIrregularity.push(irrNorm);
+              if (window.arduinoIrregularity.length > 10) window.arduinoIrregularity.shift();
+            }
+          }
+        }
+      }
+
+      lastProcessedIndex = Math.max(0, n - 2);
+    }, 40); // run ~25Hz
+
+    return () => clearInterval(detectionInterval);
+  }, []);
+
   useEffect(() => {
     // whenever beatsRef updates or bpm changes, recompute rhythm metrics
     const compute = () => {
